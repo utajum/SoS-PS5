@@ -34,6 +34,15 @@ void EmitKillIfPixelValidMaskInactive(SpirvEmitterState& state) {
     const auto active = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), maskValue, state.pixelValidMaskVariable);
     state.module.AddFunction(spv::OpINotEqual, TypeBool(state), active, maskValue, ConstantU32(state, 0u));
+    // Helper lanes never write, so spare them: Mesa 26 ACO folds demote_if(is_helper_invocation) to exec = 0.
+    if (const auto helperVariable = InputVariableForKind(state, StageInputKind::HelperInvocation); helperVariable != 0) {
+        const auto helper = state.module.AllocateId();
+        const auto keep = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), helper, helperVariable);
+        state.module.AddFunction(spv::OpLogicalOr, TypeBool(state), keep, active, helper);
+        EmitKillIfBoolFalse(state, keep);
+        return;
+    }
     EmitKillIfBoolFalse(state, active);
 }
 
