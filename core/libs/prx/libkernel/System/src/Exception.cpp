@@ -193,11 +193,13 @@ void MarkServed(std::uintptr_t host) {
 
 void GuestSignalHandler(int, siginfo_t*, void* hostContext) {
     const auto host = static_cast<std::uintptr_t>(pthread_self());
+    // The title's suspend handler parks until the collector resumes the world, so the raiser
+    // only waits for arrival; marking after the handler made every raise hit APS5_GC_WAIT_MS.
+    MarkServed(host);
     if (const Pthread self = scePthreadSelf(); self != nullptr) {
         if (const int pending = self->pendingException.exchange(0)) RunExceptionHandlerInline(pending, hostContext);
         self->exceptionServed.fetch_add(1, std::memory_order_release);
     }
-    MarkServed(host);
 }
 
 void EnsureGuestSignal() {
@@ -347,10 +349,12 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
     }
     if (useSignal && thread->hostThread != nullptr && !thread->_finished.load(std::memory_order_acquire)) {
         const auto id = static_cast<pthread_t>(reinterpret_cast<std::uintptr_t>(thread->hostThread));
+        // Baseline before the kill: the handler can mark arrival before pthread_kill even returns.
+        const auto hostKey = reinterpret_cast<std::uintptr_t>(thread->hostThread);
+        const unsigned before = servedBefore + ServedOn(hostKey);
+        // No UmtxWakeWaiters here: the signal already reaches parked threads, and waking them all
+        // lets the next raise land while one holds its bucket lock (deadlock once it parks).
         if (pthread_kill(id, GuestExceptionSignal()) == 0) {
-            UmtxWakeWaiters();
-            const auto hostKey = reinterpret_cast<std::uintptr_t>(thread->hostThread);
-            const unsigned before = servedBefore + ServedOn(hostKey);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(gcWaitMillis());
             while (ServedOn(hostKey) + servedBefore == before &&
                    std::chrono::steady_clock::now() < deadline &&
