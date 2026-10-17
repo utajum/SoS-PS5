@@ -47,23 +47,35 @@ void Unlink(Bucket& bucket, Waiter* waiter) {
         if (*link == waiter) { *link = waiter->next; return; }
 }
 #else
-// Linux has no per-waiter kernel event, so the same address-keyed waiter list
-// is guarded by a mutex and woken through one condition variable.
-struct Waiter { void* address; bool signaled; Waiter* next; };
-std::mutex waitMutex;
-std::condition_variable waitCv;
-Waiter* head = nullptr;
-void Lock() { waitMutex.lock(); }
-void Unlock() { waitMutex.unlock(); }
-void Unlink(Waiter* waiter) {
-    for (Waiter** link = &head; *link; link = &(*link)->next)
+// Per-waiter condition variable in address-hashed buckets, like the Windows events: a wake
+// touches only the woken thread instead of every parked one.
+struct Waiter { void* address; bool signaled; Waiter* next; std::condition_variable cv; };
+
+constexpr std::size_t BucketCount = 64;
+struct alignas(64) Bucket {
+    std::mutex lock;
+    Waiter* head = nullptr;
+};
+Bucket buckets[BucketCount];
+
+Bucket& BucketOf(const void* address) {
+    const auto hashed = (reinterpret_cast<std::uintptr_t>(address) >> 2) * 0x9e3779b97f4a7c15ull;
+    return buckets[hashed >> 58];
+}
+void Unlink(Bucket& bucket, Waiter* waiter) {
+    for (Waiter** link = &bucket.head; *link; link = &(*link)->next)
         if (*link == waiter) { *link = waiter->next; return; }
 }
 
 // A guest exception raised against a thread parked here is only noticed when the wait loop
 // re-checks pendingException, i.e. at the end of the current slice. Waking every waiter makes
 // stop-the-world delivery prompt instead of one slice late.
-void WakeWaiters() { std::lock_guard lock(waitMutex); waitCv.notify_all(); }
+void WakeWaiters() {
+    for (auto& bucket : buckets) {
+        std::lock_guard lock(bucket.lock);
+        for (Waiter* waiter = bucket.head; waiter; waiter = waiter->next) waiter->cv.notify_one();
+    }
+}
 #endif
 }
 
@@ -179,11 +191,12 @@ int APS5_VABI _umtx_op_nid_postfix(void* object, int op, unsigned long value, vo
         }
         if (Trace()) aps5::LogErr("[umtx] wait addr=%p val=%llx cur=%llx timeout=%lld\n", object, static_cast<unsigned long long>(expected), static_cast<unsigned long long>(readAt(object, wide)), millis);
         Waiter waiter{object, false, nullptr};
-        std::unique_lock lock(waitMutex);
+        Bucket& bucket = BucketOf(object);
+        std::unique_lock lock(bucket.lock);
         bool timedOut = false;
         if (readAt(object, wide) == expected && self->pendingException.load() == 0) {
-            waiter.next = head;
-            head = &waiter;
+            waiter.next = bucket.head;
+            bucket.head = &waiter;
             char target[40];
             std::snprintf(target, sizeof(target), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(object)));
             KernelParkEnter_nid_postfix("umtx", target, __builtin_return_address(0));
@@ -198,10 +211,10 @@ int APS5_VABI _umtx_op_nid_postfix(void* object, int op, unsigned long value, vo
                 if (now >= deadline) { timedOut = true; break; }
                 const auto slice = millis < 0 ? std::chrono::milliseconds(200)
                                  : std::min(std::chrono::milliseconds(200), std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
-                waitCv.wait_for(lock, slice);
+                waiter.cv.wait_for(lock, slice);
             }
             self->inWait.store(false);
-            if (!waiter.signaled) Unlink(&waiter);
+            if (!waiter.signaled) Unlink(bucket, &waiter);
             KernelParkLeave_nid_postfix();
         }
         lock.unlock();
@@ -215,25 +228,26 @@ int APS5_VABI _umtx_op_nid_postfix(void* object, int op, unsigned long value, vo
         if (!object) return fail(GuestInvalid);
         if (Trace()) aps5::LogErr("[umtx] wake addr=%p n=%lu\n", object, value);
         unsigned long remaining = value;
-        std::lock_guard lock(waitMutex);
-        for (Waiter** link = &head; *link && remaining;) {
+        Bucket& bucket = BucketOf(object);
+        std::lock_guard lock(bucket.lock);
+        for (Waiter** link = &bucket.head; *link && remaining;) {
             Waiter* waiter = *link;
-            if (waiter->address == object) { *link = waiter->next; waiter->signaled = true; --remaining; }
+            if (waiter->address == object) { *link = waiter->next; waiter->signaled = true; waiter->cv.notify_one(); --remaining; }
             else link = &waiter->next;
         }
-        waitCv.notify_all();
         return 0;
     }
     case OpNWakePrivate: {
         auto* addresses = static_cast<void* const*>(object);
-        std::lock_guard lock(waitMutex);
-        for (unsigned long i = 0; i < value; ++i)
-            for (Waiter** link = &head; *link;) {
+        for (unsigned long i = 0; i < value; ++i) {
+            Bucket& bucket = BucketOf(addresses[i]);
+            std::lock_guard lock(bucket.lock);
+            for (Waiter** link = &bucket.head; *link;) {
                 Waiter* waiter = *link;
-                if (waiter->address == addresses[i]) { *link = waiter->next; waiter->signaled = true; break; }
+                if (waiter->address == addresses[i]) { *link = waiter->next; waiter->signaled = true; waiter->cv.notify_one(); break; }
                 link = &waiter->next;
             }
-        waitCv.notify_all();
+        }
         return 0;
     }
     default: {
