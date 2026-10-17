@@ -1,5 +1,7 @@
 # SonsOfSparta-PS5 Native
 
+**SteamOS (native Linux, AMD): see [STEAMOS.md](STEAMOS.md).**
+
 **God of War: Sons of Sparta for PS5, running on Windows through AnyPS5. The compatibility layer also builds and runs on Linux - see [Linux](#linux).**
 
 Made possible by the [AnyPS5](https://github.com/boykopovar/AnyPS5) project. The source code is in this repository and the build is on the [Releases](../../releases) page.
