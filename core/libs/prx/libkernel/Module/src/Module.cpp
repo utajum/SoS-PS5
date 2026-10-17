@@ -12,6 +12,57 @@
 #include <psapi.h>
 #else
 #include <fstream>
+#include <link.h>
+#include <mutex>
+#include <string_view>
+#include <vector>
+
+namespace {
+// File-backed mappings do not move once loaded; the unwinder asks once per frame per throw.
+struct CachedUnwind { std::uint64_t start, end; ModuleInfoForUnwind info; };
+std::mutex unwindCacheMutex;
+std::vector<CachedUnwind> unwindCache;
+
+// The PS5 unwinder finds FDEs through this query; relinked images keep the title's PT_GNU_EH_FRAME.
+void FillEhFrame(std::uint64_t addr, ModuleInfoForUnwind* info) {
+  struct Search { std::uint64_t addr; ModuleInfoForUnwind* info; } search{addr, info};
+  dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
+    auto& s = *static_cast<Search*>(data);
+    const ElfW(Phdr)* frames = nullptr;
+    bool contains = false;
+    for (std::uint16_t i = 0; i < image->dlpi_phnum; ++i) {
+      const auto& h = image->dlpi_phdr[i];
+      const std::uint64_t start = image->dlpi_addr + h.p_vaddr;
+      if (h.p_type == PT_LOAD && s.addr >= start && s.addr - start < h.p_memsz) contains = true;
+      if (h.p_type == PT_GNU_EH_FRAME) frames = &h;
+    }
+    if (!contains) return 0;
+    const std::string_view name = image->dlpi_name ? image->dlpi_name : "";
+    if (!frames || !(name.empty() || name.ends_with(".guest.prx"))) return 1;
+    const std::uint64_t hdr = image->dlpi_addr + frames->p_vaddr;
+    const auto* b = reinterpret_cast<const std::uint8_t*>(hdr);
+    if (b[0] != 1 || b[1] != 0x1b) return 1;  // version 1, eh_frame_ptr pcrel|sdata4
+    std::int32_t rel;
+    std::memcpy(&rel, b + 4, sizeof rel);
+    const std::uint64_t eh = hdr + 4 + static_cast<std::int64_t>(rel);
+    std::uint64_t end = 0;
+    for (std::uint16_t i = 0; i < image->dlpi_phnum; ++i) {
+      const auto& h = image->dlpi_phdr[i];
+      const std::uint64_t start = image->dlpi_addr + h.p_vaddr;
+      if (h.p_type == PT_LOAD && eh >= start && eh - start < h.p_filesz) end = start + h.p_filesz;
+    }
+    std::uint64_t pos = eh;
+    for (std::uint32_t len; pos + 4 <= end; pos += 4 + len) {
+      std::memcpy(&len, reinterpret_cast<const void*>(pos), sizeof len);
+      if (len == 0 || len == 0xffffffffu || len > end - pos - 4) break;
+    }
+    s.info->eh_frame_hdr_addr = hdr;
+    s.info->eh_frame_addr = eh;
+    s.info->eh_frame_size = pos - eh;
+    return 1;
+  }, &search);
+}
+}
 #endif
 
 extern "C" {
@@ -53,6 +104,12 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->name[sizeof(info->name) - 1] = '\0';
   return 0;
 #else
+  {
+    std::lock_guard lock(unwindCacheMutex);
+    for (const auto& cached : unwindCache) {
+      if (addr >= cached.start && addr < cached.end) { *info = cached.info; return 0; }
+    }
+  }
   std::ifstream maps("/proc/self/maps");
   if (!maps) throw std::runtime_error("sceKernelGetModuleInfoForUnwind: failed to open /proc/self/maps");
   std::string line;
@@ -77,6 +134,11 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
     info->eh_frame_size = 0;
     info->seg0_addr = start;
     info->seg0_size = end - start;
+    FillEhFrame(addr, info);
+    if (info->name[0] != '\0') {
+      std::lock_guard lock(unwindCacheMutex);
+      unwindCache.push_back({start, end, *info});
+    }
     return 0;
   }
   return SCE_KERNEL_ERROR_ESRCH;

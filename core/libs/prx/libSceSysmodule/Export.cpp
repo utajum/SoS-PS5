@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -45,6 +46,16 @@ bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
     info->name[sizeof(info->name) - 1] = '\0';
     return true;
 #else
+    // File-backed mappings do not move once loaded; the unwinder asks once per frame per throw.
+    struct Cached { std::uint64_t start, end; ModuleInfoForUnwind info; };
+    static std::mutex cacheMutex;
+    static std::vector<Cached> cache;
+    {
+        std::lock_guard lock(cacheMutex);
+        for (const auto& cached : cache) {
+            if (addr >= cached.start && addr < cached.end) { *info = cached.info; return true; }
+        }
+    }
     std::ifstream maps("/proc/self/maps");
     if (!maps) {
         throw std::runtime_error("sceSysmoduleGetModuleInfoForUnwind: failed to open /proc/self/maps");
@@ -82,6 +93,10 @@ bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
         info->eh_frame_size = 0;
         info->seg0_addr = start;
         info->seg0_size = end - start;
+        if (parsed >= 8) {
+            std::lock_guard lock(cacheMutex);
+            cache.push_back({start, end, *info});
+        }
         return true;
     }
     return false;
