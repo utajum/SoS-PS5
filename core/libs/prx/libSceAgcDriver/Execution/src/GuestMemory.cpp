@@ -4,6 +4,24 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
+#ifndef PROCMAP_QUERY
+// Kernel 6.11 uapi, for build hosts with older headers.
+enum procmap_query_flags {
+    PROCMAP_QUERY_VMA_READABLE = 0x01,
+    PROCMAP_QUERY_VMA_WRITABLE = 0x02,
+    PROCMAP_QUERY_VMA_EXECUTABLE = 0x04,
+    PROCMAP_QUERY_VMA_SHARED = 0x08,
+    PROCMAP_QUERY_COVERING_OR_NEXT_VMA = 0x10,
+    PROCMAP_QUERY_FILE_BACKED_VMA = 0x20,
+};
+struct procmap_query {
+    __u64 size, query_flags, query_addr, vma_start, vma_end, vma_flags, vma_page_size, vma_offset, inode;
+    __u32 dev_major, dev_minor, vma_name_size, build_id_size;
+    __u64 vma_name_addr, build_id_addr;
+};
+static_assert(sizeof(procmap_query) == 104);
+#define PROCMAP_QUERY _IOWR('f', 17, struct procmap_query)
+#endif
 #endif
 #include "prx/common/StderrLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
