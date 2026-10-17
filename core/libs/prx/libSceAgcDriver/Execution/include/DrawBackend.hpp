@@ -67,7 +67,12 @@ private:
                     if (stopping) return;
 
                     lock.unlock();
+#ifdef _WIN32
                     for (int spin = 0; spin < 4000 && queued.load(std::memory_order_acquire) == 0; ++spin) std::this_thread::yield();
+#else
+                    // sched_yield is a syscall on Linux; spin briefly on pause before sleeping
+                    for (int spin = 0; spin < 1000 && queued.load(std::memory_order_acquire) == 0; ++spin) __builtin_ia32_pause();
+#endif
                     lock.lock();
                     if (!pending.empty() || stopping) continue;
                     asleep = true;
